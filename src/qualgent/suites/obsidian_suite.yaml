@@ -1,0 +1,45 @@
+# Obsidian QA Test Suite
+# Mixed pass/fail tests for the Obsidian mobile app
+
+app_package: md.obsidian
+
+tests:
+  - id: T1_create_vault
+    name: Create and Enter Vault
+    description: >
+      Open Obsidian, create a new Vault named 'InternVault', and enter the vault.
+    expected_result: >
+      The app navigates into the InternVault. The vault UI is visible with
+      the vault name 'InternVault' shown somewhere (title, sidebar, or vault switcher).
+      A file list or empty vault welcome screen should be visible.
+    should_pass: true
+
+  - id: T2_create_note
+    name: Create Note with Content
+    description: >
+      Create a new note titled 'Meeting Notes' and type the text 'Daily Standup' into the body.
+    expected_result: >
+      A note named 'Meeting Notes' exists and is open. The note body contains
+      the text 'Daily Standup'. The note should be visible in the file list/sidebar.
+    should_pass: true
+
+  - id: T3_appearance_color_check
+    name: Verify Appearance Icon Color (Expected Fail)
+    description: >
+      Go to Settings and verify that the 'Appearance' tab icon is the color Red.
+    expected_result: >
+      The Appearance tab/section icon is RED in color.
+    should_pass: false
+    # Note: The icon is actually monochrome/default theme color, NOT red.
+    # The agent should detect this mismatch and report a failure.
+
+  - id: T4_print_to_pdf
+    name: Find Print to PDF Button (Expected Fail)
+    description: >
+      Find and click the 'Print to PDF' button in the main file menu.
+    expected_result: >
+      A 'Print to PDF' button or menu option is found and clicked successfully.
+    should_pass: false
+    # Note: This feature does not exist in this location on the mobile version.
+    # The agent should report that the element was not found.
+
