@@ -1,5 +1,5 @@
 # venv (yours is named "qualgent/")
-qualgent/
+/qualgent/
 .venv/
 venv/
 
@@ -17,3 +17,7 @@ htmlcov/
 # editors
 .vscode/
 .idea/
+
+# secrets
+.env
+.env.*
