@@ -1,0 +1,19 @@
+# venv (yours is named "qualgent/")
+qualgent/
+.venv/
+venv/
+
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
+
+# editors
+.vscode/
+.idea/

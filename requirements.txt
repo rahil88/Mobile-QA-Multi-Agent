@@ -1,0 +1,15 @@
+# Qualgent - QA Agent for Mobile Apps
+# Core dependencies
+
+# HTTP client for Gemini API
+httpx>=0.27.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# YAML parsing for test suites
+PyYAML>=6.0.1
+
+# Testing
+pytest>=8.0.0
+
