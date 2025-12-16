@@ -7,6 +7,7 @@ venv/
 __pycache__/
 *.py[cod]
 *.pyo
+*.egg-info/
 .pytest_cache/
 .coverage
 htmlcov/
