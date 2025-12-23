@@ -1,10 +1,11 @@
-"""Gemini client for vision + text prompts."""
+"""OpenAI client for vision + text prompts."""
 
 from __future__ import annotations
 
 import base64
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -12,14 +13,14 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
-__all__ = ["GeminiClient", "GeminiError"]
+__all__ = ["OpenAIClient", "OpenAIError"]
 
 # Load .env from project root
 load_dotenv()
 
 
-class GeminiError(Exception):
-    """Raised when Gemini API call fails."""
+class OpenAIError(Exception):
+    """Raised when OpenAI API call fails."""
 
     def __init__(
         self,
@@ -33,39 +34,39 @@ class GeminiError(Exception):
         self.response_body = response_body
 
 
-class GeminiClient:
-    """Client for Google Gemini API with vision support.
+class OpenAIClient:
+    """Client for OpenAI API with vision support.
 
     Parameters
     ----------
     api_key
-        Gemini API key. If not provided, reads from GEMINI_API_KEY env var.
+        OpenAI API key. If not provided, reads from OPENAI_API_KEY env var.
     model
-        Model name to use. Defaults to "gemini-2.0-flash".
+        Model name to use. Defaults to "gpt-5-mini".
     timeout_s
         Request timeout in seconds.
     """
 
-    BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+    BASE_URL = "https://api.openai.com/v1/chat/completions"
 
     def __init__(
         self,
         api_key: str | None = None,
         *,
-        model: str = "gemini-2.0-flash",
+        model: str = "gpt-5-mini",
         timeout_s: float = 60.0,
     ) -> None:
-        self._api_key = api_key or os.getenv("GEMINI_API_KEY")
+        self._api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self._api_key:
-            raise GeminiError(
-                "GEMINI_API_KEY not found. Set it in .env or pass api_key param."
+            raise OpenAIError(
+                "OPENAI_API_KEY not found. Set it in .env or pass api_key param."
             )
         self._model = model
         self._timeout = timeout_s
         self._client = httpx.Client(timeout=self._timeout)
 
     def _encode_image(self, image_path: Path) -> dict[str, Any]:
-        """Encode an image file as base64 inline data for Gemini."""
+        """Encode an image file as base64 data URL for OpenAI."""
         data = image_path.read_bytes()
         b64 = base64.b64encode(data).decode("utf-8")
 
@@ -81,10 +82,11 @@ class GeminiClient:
         mime_type = mime_map.get(suffix, "image/png")
 
         return {
-            "inline_data": {
-                "mime_type": mime_type,
-                "data": b64,
-            }
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime_type};base64,{b64}",
+                "detail": "high",
+            },
         }
 
     def generate(
@@ -115,56 +117,73 @@ class GeminiClient:
 
         Raises
         ------
-        GeminiError
+        OpenAIError
             If the API call fails.
         """
-        # Build content parts
-        parts: list[dict[str, Any]] = []
+        # Build content array
+        content: list[dict[str, Any]] = []
 
         # Add images first (if any)
         if images:
             for img_path in images:
-                parts.append(self._encode_image(img_path))
+                content.append(self._encode_image(img_path))
 
         # Add text prompt
-        parts.append({"text": prompt})
+        content.append({"type": "text", "text": prompt})
 
         # Build request payload
-        payload = {
-            "contents": [{"parts": parts}],
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens,
-            },
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ],
+            "max_completion_tokens": max_tokens,
         }
+        
+        # Only include temperature if not using a model that restricts it
+        # gpt-5-mini and similar models only support the default temperature (1)
+        if not self._model.startswith("gpt-5"):
+            payload["temperature"] = temperature
 
-        url = f"{self.BASE_URL}/{self._model}:generateContent?key={self._api_key}"
-
-        # Retry logic for rate limits (429) and server errors (503)
+        # Retry logic for rate limits (429)
         max_retries = 5
         base_delay = 1.0
 
         for attempt in range(max_retries):
             try:
                 response = self._client.post(
-                    url,
+                    self.BASE_URL,
                     json=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self._api_key}",
+                    },
                 )
             except httpx.RequestError as exc:
-                raise GeminiError(f"Request failed: {exc}") from exc
+                raise OpenAIError(f"Request failed: {exc}") from exc
 
             if response.status_code == 200:
                 break
 
-            if response.status_code in (429, 503) and attempt < max_retries - 1:
+            if response.status_code == 429 and attempt < max_retries - 1:
+                # Parse retry delay from error message if available
                 delay = base_delay * (2 ** attempt)  # Exponential backoff
+                try:
+                    # Try to extract delay from message like "try again in 413ms"
+                    match = re.search(r"try again in (\d+)ms", response.text)
+                    if match:
+                        delay = max(delay, int(match.group(1)) / 1000 + 0.5)
+                except Exception:
+                    pass
                 print(f"    [Rate limit] Waiting {delay:.1f}s before retry {attempt + 2}/{max_retries}...")
                 time.sleep(delay)
                 continue
 
-            raise GeminiError(
-                f"Gemini API returned {response.status_code}: {response.text[:500]}",
+            raise OpenAIError(
+                f"OpenAI API returned {response.status_code}: {response.text[:500]}",
                 status_code=response.status_code,
                 response_body=response.text,
             )
@@ -173,16 +192,13 @@ class GeminiClient:
 
         # Extract text from response
         try:
-            candidates = data.get("candidates", [])
-            if not candidates:
-                raise GeminiError(f"No candidates in response: {data}")
-            content = candidates[0].get("content", {})
-            parts = content.get("parts", [])
-            if not parts:
-                raise GeminiError(f"No parts in response: {data}")
-            return parts[0].get("text", "")
+            choices = data.get("choices", [])
+            if not choices:
+                raise OpenAIError(f"No choices in response: {data}")
+            message = choices[0].get("message", {})
+            return message.get("content", "")
         except (KeyError, IndexError) as exc:
-            raise GeminiError(f"Failed to parse response: {data}") from exc
+            raise OpenAIError(f"Failed to parse response: {data}") from exc
 
     def generate_json(
         self,
@@ -219,7 +235,7 @@ class GeminiClient:
 
         Raises
         ------
-        GeminiError
+        OpenAIError
             If JSON parsing fails after retries.
         """
         response_text = self.generate(
@@ -232,7 +248,7 @@ class GeminiClient:
             return parsed
 
         if not retry_on_parse_error:
-            raise GeminiError(f"Failed to parse JSON from response: {response_text}")
+            raise OpenAIError(f"Failed to parse JSON from response: {response_text}")
 
         # Retry with stricter prompt
         retry_prompt = (
@@ -250,7 +266,7 @@ class GeminiClient:
         if parsed is not None:
             return parsed
 
-        raise GeminiError(f"Failed to parse JSON after retry: {response_text}")
+        raise OpenAIError(f"Failed to parse JSON after retry: {response_text}")
 
     def _try_parse_json(self, text: str) -> dict[str, Any] | None:
         """Attempt to parse JSON from text, handling common formatting issues."""
@@ -276,8 +292,25 @@ class GeminiClient:
         start = text.find("{")
         end = text.rfind("}") + 1
         if start != -1 and end > start:
+            json_text = text[start:end]
             try:
-                return json.loads(text[start:end])
+                return json.loads(json_text)
+            except json.JSONDecodeError:
+                pass
+
+            # Fix trailing commas (common LLM mistake)
+            # Remove trailing commas before } or ]
+            fixed = re.sub(r',(\s*[}\]])', r'\1', json_text)
+            try:
+                return json.loads(fixed)
+            except json.JSONDecodeError:
+                pass
+
+            # Fix missing commas between fields (another common LLM mistake)
+            # Pattern: "value"\n    "key" should become "value",\n    "key"
+            fixed = re.sub(r'(")\s*\n(\s*")', r'\1,\n\2', fixed)
+            try:
+                return json.loads(fixed)
             except json.JSONDecodeError:
                 pass
 
@@ -287,7 +320,7 @@ class GeminiClient:
         """Close the HTTP client."""
         self._client.close()
 
-    def __enter__(self) -> "GeminiClient":
+    def __enter__(self) -> "OpenAIClient":
         return self
 
     def __exit__(self, *args: Any) -> None:

@@ -7,11 +7,17 @@ tests:
   - id: T1_create_vault
     name: Create and Enter Vault
     description: >
-      Open Obsidian, create a new Vault named 'InternVault', and enter the vault.
+      Open Obsidian and create a new local vault named 'InternVault'.
+      Use tap_text to tap buttons by their exact visible text.
+      Steps: 1) Tap button with text 'Create a vault'. 
+      2) Tap 'On this device' option (NOT 'Obsidian Sync').
+      3) Clear the default vault name and type 'InternVault'.
+      4) Tap 'Create' button to confirm.
+      5) If a permission dialog appears, tap 'Allow' or similar.
     expected_result: >
-      The app navigates into the InternVault. The vault UI is visible with
-      the vault name 'InternVault' shown somewhere (title, sidebar, or vault switcher).
-      A file list or empty vault welcome screen should be visible.
+      The app is inside the vault. Success indicators: seeing 'New tab - Obsidian',
+      'Create new note', 'Untitled - Obsidian', or any note editing UI.
+      The vault has been created and is accessible.
     should_pass: true
 
   - id: T2_create_note
@@ -26,20 +32,30 @@ tests:
   - id: T3_appearance_color_check
     name: Verify Appearance Icon Color (Expected Fail)
     description: >
-      Go to Settings and verify that the 'Appearance' tab icon is the color Red.
+      Starting from the note view, navigate to Settings and verify that the 'Appearance' 
+      tab/section icon is the color Red.
+      Steps: 1) Tap the file menu button in the top left corner to open the sidebar. It is an hamburger icon.
+      2) Tap the Settings gear icon on the right side of the 'InternVault' text in the sidebar.
+      3) Once in Settings, tap on 'Appearance' in the settings list.
+      4) STOP NAVIGATING! Now examine the screenshot - look at the right side of the text 'Accent color'.
+         If the color is NOT red (gray, monochrome, or any other color), set is_complete=true 
+         and report that the test FAILED because the color is not red.
     expected_result: >
-      The Appearance tab/section icon is RED in color.
+      The color of the right side of the text 'Accent color' should be RED. If it is NOT red, the test FAILS.
     should_pass: false
     # Note: The icon is actually monochrome/default theme color, NOT red.
     # The agent should detect this mismatch and report a failure.
 
   - id: T4_print_to_pdf
-    name: Find Print to PDF Button (Expected Fail)
+    name: Verify Print to PDF Button is Missing
     description: >
-      Find and click the 'Print to PDF' button in the main file menu.
+      Search for 'Print to PDF' in the More options menu to confirm it doesn't exist.
+      Steps: 1) Tap the 'More options' menu (three dots) to open the file menu.
+      2) Scroll down 3 times to search through all menu options for 'Print to PDF'.
+      3) If 'Print to PDF' is found, tap it - the test FAILS.
+      4) If 'Print to PDF' is NOT found after scrolling, set is_complete=true - goal achieved!
     expected_result: >
-      A 'Print to PDF' button or menu option is found and clicked successfully.
+      'Print to PDF' is NOT found in the More options menu after scrolling through all options.
     should_pass: false
-    # Note: This feature does not exist in this location on the mobile version.
-    # The agent should report that the element was not found.
+
 

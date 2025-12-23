@@ -390,3 +390,336 @@ class AdbController:
         time.sleep(seconds)
         return f"Waited {seconds}s"
 
+    def tap_text(self, text: str, *, partial: bool = False) -> str:
+        """Find an element by its visible text and tap on it.
+
+        Uses UI Automator to dump the view hierarchy and find the element.
+
+        Parameters
+        ----------
+        text
+            The visible text to search for.
+        partial
+            If True, match elements containing the text (substring match).
+            If False (default), match exact text only.
+
+        Returns
+        -------
+        str
+            Confirmation message.
+
+        Raises
+        ------
+        AdbError
+            If the element is not found or tap fails.
+        """
+        import re
+        import xml.etree.ElementTree as ET
+
+        # Dump UI hierarchy to device
+        self._run(["shell", "uiautomator", "dump", "/sdcard/ui_dump.xml"])
+
+        # Pull the dump file
+        result = self._run(["shell", "cat", "/sdcard/ui_dump.xml"])
+        xml_content = result.stdout
+
+        # Parse XML and find element
+        try:
+            root = ET.fromstring(xml_content)
+        except ET.ParseError as exc:
+            raise AdbError(f"Failed to parse UI dump: {exc}")
+
+        # Collect ALL matching elements (includes hint/placeholder text)
+        matches = []
+        for elem in root.iter("node"):
+            elem_text = elem.get("text", "")
+            content_desc = elem.get("content-desc", "")
+            hint = elem.get("hint", "")  # Placeholder text for input fields
+
+            if partial:
+                text_lower = text.lower()
+                if (text_lower in elem_text.lower() or 
+                    text_lower in content_desc.lower() or
+                    text_lower in hint.lower()):
+                    matches.append(elem)
+            else:
+                if elem_text == text or content_desc == text or hint == text:
+                    matches.append(elem)
+
+        if not matches:
+            raise AdbError(f"Element with text '{text}' not found on screen")
+
+        # Prefer interactive elements (buttons, inputs) over static text
+        def element_priority(elem: ET.Element) -> int:
+            """Higher score = better match for tapping."""
+            score = 0
+            # Clickable elements are highest priority
+            if elem.get("clickable") == "true":
+                score += 100
+            # Check element class for interactive types
+            elem_class = elem.get("class", "")
+            if "Button" in elem_class:
+                score += 50
+            if "EditText" in elem_class or "Input" in elem_class:
+                score += 50
+            if "CheckBox" in elem_class or "Switch" in elem_class or "Radio" in elem_class:
+                score += 40
+            # Focusable elements are somewhat interactive
+            if elem.get("focusable") == "true":
+                score += 10
+            return score
+
+        # Sort by priority (highest first) and pick the best match
+        matches.sort(key=element_priority, reverse=True)
+        found_element = matches[0]
+
+        # Extract bounds and calculate center
+        bounds_str = found_element.get("bounds", "")
+        # bounds format: "[left,top][right,bottom]"
+        match = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds_str)
+        if not match:
+            raise AdbError(f"Could not parse bounds: {bounds_str}")
+
+        left, top, right, bottom = map(int, match.groups())
+        center_x = (left + right) // 2
+        center_y = (top + bottom) // 2
+
+        # Tap the center of the element
+        self._run(["shell", "input", "tap", str(center_x), str(center_y)])
+        return f"Tapped on element with text '{text}' at ({center_x}, {center_y})"
+
+    def tap_and_type(
+        self,
+        target_text: str,
+        input_text: str,
+        *,
+        partial: bool = False,
+        delay_ms: int = 300,
+    ) -> str:
+        """Tap on an element (to focus it) and then type text.
+
+        This is a compound action useful for input fields where you need
+        to first tap the field to focus it, then type into it.
+
+        Parameters
+        ----------
+        target_text
+            The visible text of the element to tap (e.g., placeholder text like "My vault").
+        input_text
+            The text to type after tapping.
+        partial
+            If True, match elements containing the target_text (substring match).
+        delay_ms
+            Delay in milliseconds between tap and typing.
+
+        Returns
+        -------
+        str
+            Confirmation message.
+
+        Raises
+        ------
+        AdbError
+            If the element is not found or actions fail.
+        """
+        import time
+
+        # First tap on the target element to focus it
+        tap_result = self.tap_text(target_text, partial=partial)
+
+        # Small delay to let the keyboard appear and field focus
+        time.sleep(delay_ms / 1000.0)
+
+        # Clear existing text by moving to end and deleting backwards
+        # This is more reliable than Ctrl+A on Android
+        self._run(["shell", "input", "keyevent", "123"])  # KEYCODE_MOVE_END
+        time.sleep(0.05)
+        # Delete existing text - send multiple DEL key events in one command
+        # 30 KEYCODE_DEL (67) events to clear typical field content
+        self._run(["shell", "input", "keyevent"] + ["67"] * 30)
+        time.sleep(0.15)
+
+        # Now type the new text
+        type_result = self.type_text(input_text)
+
+        return f"{tap_result}; Cleared existing text; {type_result}"
+
+    def dump_ui_texts(self) -> list[str]:
+        """Extract all visible text labels from the current screen.
+
+        Uses UI Automator to dump the view hierarchy and extract text.
+        Also extracts hint (placeholder) text from input fields.
+
+        Returns
+        -------
+        list[str]
+            List of visible text labels (text, content-desc, and hint values).
+        """
+        import xml.etree.ElementTree as ET
+
+        # Dump UI hierarchy to device
+        self._run(["shell", "uiautomator", "dump", "/sdcard/ui_dump.xml"])
+
+        # Pull the dump file
+        result = self._run(["shell", "cat", "/sdcard/ui_dump.xml"])
+        xml_content = result.stdout
+
+        # Parse XML and extract texts
+        texts: list[str] = []
+        try:
+            root = ET.fromstring(xml_content)
+            for elem in root.iter("node"):
+                elem_text = elem.get("text", "").strip()
+                content_desc = elem.get("content-desc", "").strip()
+                hint = elem.get("hint", "").strip()
+                if elem_text:
+                    texts.append(elem_text)
+                if content_desc and content_desc != elem_text:
+                    texts.append(content_desc)
+                # Include hint (placeholder text) for input fields
+                if hint and hint != elem_text and hint != content_desc:
+                    texts.append(hint)
+        except ET.ParseError:
+            pass  # Return empty list on parse failure
+
+        return texts
+
+    def exists_text(self, text: str, *, partial: bool = False) -> bool:
+        """Check if text exists on the current screen.
+
+        Parameters
+        ----------
+        text
+            The text to search for.
+        partial
+            If True, match elements containing the text (substring match).
+
+        Returns
+        -------
+        bool
+            True if text is found, False otherwise.
+        """
+        ui_texts = self.dump_ui_texts()
+        if partial:
+            text_lower = text.lower()
+            return any(text_lower in t.lower() for t in ui_texts)
+        return text in ui_texts
+
+    def scroll_until_text(
+        self,
+        text: str,
+        *,
+        direction: str = "down",
+        max_swipes: int = 5,
+        partial: bool = False,
+    ) -> str:
+        """Scroll the screen until the specified text is visible.
+
+        Parameters
+        ----------
+        text
+            The text to search for.
+        direction
+            Direction to scroll: "up", "down", "left", "right".
+        max_swipes
+            Maximum number of swipe attempts.
+        partial
+            If True, use substring matching for text.
+
+        Returns
+        -------
+        str
+            Confirmation message.
+
+        Raises
+        ------
+        AdbError
+            If text is not found after max_swipes.
+        """
+        # Get screen dimensions for scroll calculations
+        width, height = self.get_screen_size()
+        cx, cy = width // 2, height // 2
+
+        # Define swipe vectors based on direction
+        swipe_map = {
+            "down": (cx, int(height * 0.7), cx, int(height * 0.3)),
+            "up": (cx, int(height * 0.3), cx, int(height * 0.7)),
+            "left": (int(width * 0.7), cy, int(width * 0.3), cy),
+            "right": (int(width * 0.3), cy, int(width * 0.7), cy),
+        }
+
+        if direction not in swipe_map:
+            raise AdbError(f"Invalid scroll direction: {direction}")
+
+        x1, y1, x2, y2 = swipe_map[direction]
+
+        for attempt in range(max_swipes):
+            if self.exists_text(text, partial=partial):
+                return f"Found text '{text}' after {attempt} scroll(s)"
+
+            self.swipe(x1, y1, x2, y2, 300)
+            self.wait(0.5)
+
+        # Final check after last swipe
+        if self.exists_text(text, partial=partial):
+            return f"Found text '{text}' after {max_swipes} scroll(s)"
+
+        raise AdbError(f"Text '{text}' not found after {max_swipes} scroll(s) {direction}")
+
+    def back(self) -> str:
+        """Press the back button.
+
+        Returns
+        -------
+        str
+            Confirmation message.
+        """
+        return self.send_key_event(4)  # KEYCODE_BACK
+
+    def home(self) -> str:
+        """Press the home button.
+
+        Returns
+        -------
+        str
+            Confirmation message.
+        """
+        return self.send_key_event(3)  # KEYCODE_HOME
+
+    def relaunch_app(self, package: str) -> str:
+        """Force stop and relaunch an app.
+
+        Parameters
+        ----------
+        package
+            The package name to relaunch.
+
+        Returns
+        -------
+        str
+            Confirmation message.
+        """
+        self.force_stop(package)
+        self.wait(0.5)
+        self.launch_app(package)
+        return f"Relaunched app: {package}"
+
+    def get_current_activity(self) -> str:
+        """Get the current foreground activity.
+
+        Returns
+        -------
+        str
+            The current activity name (e.g., "com.example/.MainActivity").
+        """
+        result = self._run(["shell", "dumpsys", "activity", "activities"])
+        # Parse the output to find the focused activity
+        for line in result.stdout.splitlines():
+            if "mResumedActivity" in line or "mFocusedActivity" in line:
+                # Extract activity name from the line
+                parts = line.split()
+                for part in parts:
+                    if "/" in part and "." in part:
+                        return part.strip()
+        return ""
+

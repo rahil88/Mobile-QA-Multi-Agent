@@ -11,15 +11,41 @@ from typing import Any
 class ActionType(str, Enum):
     """Types of actions the executor can perform."""
 
+    # UI interaction
     TAP = "tap"
+    TAP_TEXT = "tap_text"  # More reliable - finds element by visible text
     SWIPE = "swipe"
     TYPE_TEXT = "type_text"
+    TAP_AND_TYPE = "tap_and_type"  # Tap on element then type - for input fields
     KEY_EVENT = "key_event"
+
+    # Navigation shortcuts
+    BACK = "back"  # Press back button (key_event 4)
+    HOME = "home"  # Press home button (key_event 3)
+
+    # App lifecycle
     LAUNCH_APP = "launch_app"
     FORCE_STOP = "force_stop"
     CLEAR_DATA = "clear_data"
+    RELAUNCH_APP = "relaunch_app"  # force_stop + launch_app combined
+
+    # Search/scroll
+    SCROLL_UNTIL_TEXT = "scroll_until_text"  # Scroll until text is visible
+
+    # Utility
     WAIT = "wait"
     SCREENSHOT = "screenshot"
+
+
+class ErrorType(str, Enum):
+    """Types of errors that can occur during action execution."""
+
+    NONE = "none"
+    ELEMENT_NOT_FOUND = "element_not_found"
+    ADB_FAILURE = "adb_failure"
+    TIMEOUT = "timeout"
+    INVALID_PARAMS = "invalid_params"
+    UNKNOWN = "unknown"
 
 
 @dataclass
@@ -82,6 +108,8 @@ class StepResult:
         The action that was executed.
     success
         Whether the action executed without errors.
+    error_type
+        Type of error if success is False.
     error_message
         Error message if success is False.
     screenshot_path
@@ -90,8 +118,40 @@ class StepResult:
 
     action: Action
     success: bool
+    error_type: ErrorType = ErrorType.NONE
     error_message: str = ""
     screenshot_path: Path | None = None
+
+
+@dataclass
+class Observation:
+    """Current state observation for the Planner/Supervisor.
+
+    Provides context about what's on screen so the LLM can make
+    grounded decisions based on actual UI state.
+
+    Attributes
+    ----------
+    screenshot_path
+        Path to current screenshot.
+    ui_texts
+        List of visible text labels extracted from UIAutomator dump.
+    activity
+        Current foreground activity (optional).
+    previous_action
+        The last action that was executed (if any).
+    previous_result
+        Result of the previous action (if any).
+    attempted_actions
+        List of actions already attempted this step (to avoid repeats).
+    """
+
+    screenshot_path: Path
+    ui_texts: list[str] = field(default_factory=list)
+    activity: str = ""
+    previous_action: Action | None = None
+    previous_result: StepResult | None = None
+    attempted_actions: list[str] = field(default_factory=list)
 
 
 class TestStatus(str, Enum):

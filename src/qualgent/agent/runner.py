@@ -18,18 +18,23 @@ from qualgent.agent.supervisor import Supervisor, SupervisorError
 from qualgent.agent.types import (
     Action,
     ActionType,
+    ErrorType,
+    Observation,
     StepResult,
     TestCase,
     TestResult,
     TestStatus,
 )
 from qualgent.llm.gemini_client import GeminiClient
+from qualgent.llm.openai_client import OpenAIClient
 from qualgent.tools.adb_controller import AdbController, AdbError
 
 __all__ = ["Runner", "RunReport"]
 
-# Maximum iterations per test to prevent infinite loops
+# Defaults for execution budgets
 MAX_ITERATIONS = 20
+DEFAULT_MAX_RETRIES_PER_STEP = 5
+DEFAULT_MAX_SCROLLS_PER_STEP = 3
 
 
 class RunReport:
@@ -156,18 +161,24 @@ class Runner:
     def __init__(
         self,
         adb: AdbController,
-        gemini: GeminiClient,
+        llm_client: GeminiClient | OpenAIClient,
         run_dir: Path,
         package: str = "md.obsidian",
+        fresh: bool = False,
+        max_retries_per_step: int = DEFAULT_MAX_RETRIES_PER_STEP,
+        max_scrolls_per_step: int = DEFAULT_MAX_SCROLLS_PER_STEP,
     ) -> None:
         self._adb = adb
-        self._gemini = gemini
+        self._llm_client = llm_client
         self._run_dir = run_dir
         self._package = package
+        self._fresh = fresh
+        self._max_retries = max_retries_per_step
+        self._max_scrolls = max_scrolls_per_step
 
         self._executor = Executor.from_adb(adb)
-        self._planner = Planner(gemini)
-        self._supervisor = Supervisor(gemini)
+        self._planner = Planner(llm_client)
+        self._supervisor = Supervisor(llm_client)
         self._report = RunReport(run_dir)
 
     def run_suite(self, tests: list[TestCase]) -> RunReport:
@@ -187,8 +198,10 @@ class Runner:
         print(f"Run directory: {self._run_dir}")
         print("-" * 40)
 
-        for test in tests:
-            result = self.run_test(test)
+        for i, test in enumerate(tests):
+            # Only clear app data on first test (sequential mode)
+            is_first_test = (i == 0)
+            result = self.run_test(test, fresh_start=is_first_test and self._fresh)
             self._report.add_result(result)
 
         self._report.finalize()
@@ -197,13 +210,45 @@ class Runner:
 
         return self._report
 
-    def run_test(self, test: TestCase) -> TestResult:
-        """Run a single test case.
+    def _capture_observation(
+        self,
+        screenshot_path: Path,
+        previous_action: Action | None = None,
+        previous_result: StepResult | None = None,
+        attempted_actions: list[str] | None = None,
+    ) -> Observation:
+        """Capture current screen observation (screenshot + UI texts)."""
+        # Get UI texts from screen
+        try:
+            ui_texts = self._adb.dump_ui_texts()
+        except AdbError:
+            ui_texts = []
+
+        # Get current activity (optional)
+        try:
+            activity = self._adb.get_current_activity()
+        except AdbError:
+            activity = ""
+
+        return Observation(
+            screenshot_path=screenshot_path,
+            ui_texts=ui_texts,
+            activity=activity,
+            previous_action=previous_action,
+            previous_result=previous_result,
+            attempted_actions=attempted_actions or [],
+        )
+
+    def run_test(self, test: TestCase, *, fresh_start: bool = False) -> TestResult:
+        """Run a single test case with observation-driven planning and recovery.
 
         Parameters
         ----------
         test
             The test case to run.
+        fresh_start
+            If True, clear app data before starting this test.
+            In sequential mode, only the first test gets fresh_start=True.
 
         Returns
         -------
@@ -222,8 +267,11 @@ class Runner:
         action_history: list[str] = []
 
         try:
-            # Setup: force stop and launch app fresh
+            # Setup: force stop and optionally clear data, then launch app
             self._adb.force_stop(self._package)
+            if fresh_start:
+                print("  [Setup] Clearing app data for fresh start...")
+                self._adb.clear_app_data(self._package)
             AdbController.wait(1.0)
             self._adb.launch_app(self._package)
             AdbController.wait(2.0)  # Wait for app to load
@@ -233,21 +281,60 @@ class Runner:
             self._adb.take_screenshot(initial_screenshot)
             screenshots.append(initial_screenshot)
 
-            # Main execution loop
+            # Main execution loop with observation-driven planning
             iteration = 0
             is_complete = False
+            previous_action: Action | None = None
+            previous_result: StepResult | None = None
+            attempted_this_step: list[str] = []
+            retry_count = 0
+            scroll_count = 0
+            back_tried = False
+            relaunch_tried = False
 
             while iteration < MAX_ITERATIONS and not is_complete:
                 iteration += 1
                 current_screenshot = screenshots[-1]
 
-                print(f"  [Step {iteration}] Planning next action...")
+                # Add delay between steps to avoid rate limits (especially for OpenAI)
+                if iteration > 1:
+                    import time
+                    time.sleep(1.0)  # 1 second delay between steps
 
-                # Get plan from planner
+                print(f"  [Step {iteration}] Capturing observation and planning...")
+
+                # Capture observation (screenshot + UI dump)
+                observation = self._capture_observation(
+                    screenshot_path=current_screenshot,
+                    previous_action=previous_action,
+                    previous_result=previous_result,
+                    attempted_actions=attempted_this_step,
+                )
+
+                # Log visible UI texts for debugging
+                if observation.ui_texts:
+                    print(f"    UI texts: {observation.ui_texts[:5]}{'...' if len(observation.ui_texts) > 5 else ''}")
+
+                # Interim verification: check if goal is already achieved every 3 steps
+                if iteration > 0 and iteration % 3 == 0:
+                    try:
+                        interim_verdict = self._supervisor.verify_step(
+                            expected_result=test.expected_result,
+                            screenshot_path=current_screenshot,
+                            ui_texts=observation.ui_texts,
+                        )
+                        if interim_verdict.status == TestStatus.PASSED and interim_verdict.confidence > 0.8:
+                            print(f"    [Supervisor] Goal achieved early! (confidence: {interim_verdict.confidence:.0%})")
+                            is_complete = True
+                            break
+                    except SupervisorError:
+                        pass  # Continue if interim check fails
+
+                # Get plan from planner using observation
                 try:
-                    plan = self._planner.plan_next_actions(
+                    plan = self._planner.plan_next_action(
                         test_goal=test.description,
-                        screenshot_path=current_screenshot,
+                        observation=observation,
                         previous_actions=action_history[-5:],
                         step_context=f"Expected: {test.expected_result}",
                     )
@@ -264,22 +351,59 @@ class Runner:
                     print("  [Planner] No actions to take")
                     break
 
-                # Execute planned actions
-                for action in plan.actions:
-                    print(f"    Executing: {action.action_type.value} - {action.description}")
-                    action_history.append(f"{action.action_type.value}: {action.description}")
+                # Execute the planned action (one at a time now)
+                action = plan.actions[0]
+                action_key = f"{action.action_type.value}:{action.params}"
 
-                    result = self._executor.execute(action)
-                    steps.append(result)
+                print(f"    Executing: {action.action_type.value} - {action.description}")
+                action_history.append(f"{action.action_type.value}: {action.description}")
 
-                    if not result.success:
-                        print(f"    Action failed: {result.error_message}")
-                        break
+                result = self._executor.execute(action)
+                steps.append(result)
+                previous_action = action
+                previous_result = result
 
-                    # Wait a bit for UI to settle
+                if result.success:
+                    # Success - reset recovery counters
+                    attempted_this_step = []
+                    retry_count = 0
+                    scroll_count = 0
+                    back_tried = False
+                    relaunch_tried = False
                     AdbController.wait(0.5)
+                else:
+                    # Failure - try recovery
+                    print(f"    Action failed: {result.error_message}")
+                    attempted_this_step.append(action_key)
+                    retry_count += 1
 
-                # Take screenshot after actions
+                    if retry_count >= self._max_retries:
+                        print(f"    [Recovery] Max retries ({self._max_retries}) exceeded")
+
+                        # Escalation ladder
+                        if result.error_type == ErrorType.ELEMENT_NOT_FOUND and scroll_count < self._max_scrolls:
+                            print(f"    [Recovery] Trying scroll down (attempt {scroll_count + 1}/{self._max_scrolls})")
+                            self._adb.swipe(540, 1500, 540, 500, 300)
+                            scroll_count += 1
+                            retry_count = 0  # Reset retry count after scroll
+                            AdbController.wait(0.5)
+                        elif not back_tried:
+                            print("    [Recovery] Trying BACK button")
+                            self._adb.back()
+                            back_tried = True
+                            retry_count = 0
+                            AdbController.wait(0.5)
+                        elif not relaunch_tried:
+                            print("    [Recovery] Relaunching app")
+                            self._adb.relaunch_app(self._package)
+                            relaunch_tried = True
+                            retry_count = 0
+                            AdbController.wait(2.0)
+                        else:
+                            print("    [Recovery] All recovery options exhausted")
+                            break
+
+                # Take screenshot after action
                 step_screenshot = test_dir / f"{iteration:03d}_step.png"
                 self._adb.take_screenshot(step_screenshot)
                 screenshots.append(step_screenshot)
@@ -288,12 +412,16 @@ class Runner:
             print("  [Supervisor] Verifying final state...")
             final_screenshot = screenshots[-1]
 
+            # Capture final observation for supervisor
+            final_observation = self._capture_observation(screenshot_path=final_screenshot)
+
             try:
                 verdict = self._supervisor.verify_test_completion(
                     test_goal=test.description,
                     expected_result=test.expected_result,
                     final_screenshot=final_screenshot,
                     action_history=action_history,
+                    ui_texts=final_observation.ui_texts,
                 )
             except SupervisorError as e:
                 print(f"  [Supervisor] Error: {e}")
@@ -401,6 +529,47 @@ def main() -> None:
         default=None,
         help="Output directory for run artifacts (default: runs/<timestamp>)",
     )
+    parser.add_argument(
+        "--test-id",
+        action="append",
+        default=None,
+        help="Run only a specific test id. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--list-tests",
+        action="store_true",
+        help="List tests in the suite and exit.",
+    )
+    parser.add_argument(
+        "--provider",
+        type=str,
+        choices=["gemini", "openai"],
+        default="gemini",
+        help="LLM provider to use (default: gemini)",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Clear app data before each test (fresh install state)",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Model to use. Defaults: gemini=gemini-2.0-flash, openai=gpt-5-mini",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=DEFAULT_MAX_RETRIES_PER_STEP,
+        help=f"Max retries per step before escalating (default: {DEFAULT_MAX_RETRIES_PER_STEP})",
+    )
+    parser.add_argument(
+        "--max-scrolls",
+        type=int,
+        default=DEFAULT_MAX_SCROLLS_PER_STEP,
+        help=f"Max scroll attempts when element not found (default: {DEFAULT_MAX_SCROLLS_PER_STEP})",
+    )
 
     args = parser.parse_args()
 
@@ -416,6 +585,22 @@ def main() -> None:
     suite_package, tests = load_suite(args.suite)
     package = args.package or suite_package
 
+    # List tests and exit if requested
+    if args.list_tests:
+        print(f"Loaded {len(tests)} tests from {args.suite}")
+        for t in tests:
+            exp = "should_pass" if t.should_pass else "should_fail"
+            print(f"  - {t.id}: {t.name} ({exp})")
+        sys.exit(0)
+
+    # Filter to specific test(s) if requested
+    if args.test_id:
+        wanted = set(args.test_id)
+        tests = [t for t in tests if t.id in wanted]
+        if not tests:
+            print(f"ERROR: None of the requested --test-id values were found: {sorted(wanted)}")
+            sys.exit(1)
+
     print(f"Loaded {len(tests)} tests from {args.suite}")
     print(f"Target device: {args.serial}")
     print(f"App package: {package}")
@@ -428,10 +613,26 @@ def main() -> None:
         print(f"ERROR: Package {package} is not installed on {args.serial}")
         sys.exit(1)
 
-    gemini = GeminiClient()
+    # Initialize LLM client based on provider
+    if args.provider == "openai":
+        model = args.model or "gpt-5-mini"
+        llm_client = OpenAIClient(model=model)
+        print(f"Using provider: OpenAI, model: {model}")
+    else:
+        model = args.model or "gemini-2.0-flash"
+        llm_client = GeminiClient(model=model)
+        print(f"Using provider: Gemini, model: {model}")
 
     # Run tests
-    runner = Runner(adb, gemini, run_dir, package)
+    runner = Runner(
+        adb,
+        llm_client,
+        run_dir,
+        package,
+        fresh=args.fresh,
+        max_retries_per_step=args.max_retries,
+        max_scrolls_per_step=args.max_scrolls,
+    )
     report = runner.run_suite(tests)
 
     # Exit with error code if any tests had unexpected outcomes
