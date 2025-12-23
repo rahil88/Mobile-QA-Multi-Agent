@@ -22,3 +22,4 @@ htmlcov/
 # secrets
 .env
 .env.*
+runs/
